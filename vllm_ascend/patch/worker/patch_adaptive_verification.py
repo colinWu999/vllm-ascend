@@ -1,6 +1,8 @@
 import torch
 from torch.overrides import TorchFunctionMode
-from vllm.v1.worker.gpu.spec_decode import adaptive_verification
+from vllm.v1.worker.gpu.spec_decode import adaptive_verification, speculator
+
+from vllm_ascend.worker.v2.spec_decode.acceptance_estimator import AscendOnlineAcceptanceEstimator
 
 from vllm_ascend.utils import vllm_version_is
 
@@ -39,3 +41,8 @@ if vllm_version_is("0.32.0"):
             return _original_assign_draft_token_budget(*args, **kwargs)
 
     adaptive_verification._assign_draft_token_budget_compiled = _assign_draft_token_budget_ascend
+
+# All supported vLLM versions provide the online estimator. Replace the
+# constructor shared by draft-model speculators, leaving DSpark's trained
+# confidence-head path and the Ascend budget allocator above unchanged.
+speculator.OnlineAcceptanceEstimator = AscendOnlineAcceptanceEstimator
