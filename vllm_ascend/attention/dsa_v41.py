@@ -37,6 +37,7 @@ from vllm_ascend.core.kv_cache_interface import (
     get_storage_block_size,
 )
 from vllm_ascend.device.device_op import DeviceOperator
+from vllm_ascend.models.deepseek_v41.cache_config import STATE_RING_ROWS
 from vllm_ascend.ops.rope_dsv4 import (
     get_cos_and_sin_dsa,
     get_full_cos_and_sin_dsa_for_layer,
@@ -132,39 +133,27 @@ def build_replay_swa_visible_lens(
 ) -> torch.Tensor:
     """How many ori KV entries each query token may actually see.
 
-    Upstream's SWA kernels clamp the window per request (``start_pos =
-    max(start_pos, replay_start)``), and the clamp is a correctness requirement
-    rather than a refinement: a replayed request recomputes the hit's last
-    window, so the sliding-window group holds no KV of its own below
-    ``replay_start``. Those blocks were retired and replaced by the null block,
-    whose KV upstream documents as all-zero -- the window would not read another
-    request's data, it would read phantom keys that score zero and take weight
-    in the replayed token's softmax.
-
-    This operator bounds a window with one scalar for the whole call
-    (``ori_win_left``), which cannot express a per-token floor, so the floor
-    travels through ``ori_topk_length`` in band mode: "the number of ori KV
-    entries this query token may see". Entries are counted back from the token's
-    own right edge, so a count of ``position - floor + 1`` is exactly "keep the
-    window ending here, but not past the floor".
-
-    Positions are derived the way the operator derives its own, from
-    ``seqused_ori_kv - actS1Size + s1``, so the two coordinate systems cannot
-    drift. Device-side only: no ``.item()``, no host round trip. The caller
-    guarantees ``num_tokens`` is the sum of the query lengths, as
-    :func:`build_dspark_swa_indices` does for the other user of this channel.
+    Upstream's SWA kernels clamp the window per request. FULL graphs may
+    include a padded tail beyond the last device query boundary; those
+    rows have no visible keys.
     """
     query_lens = query_start_loc[1:] - query_start_loc[:-1]
-    req_ids = torch.repeat_interleave(
-        torch.arange(query_lens.shape[0], device=query_start_loc.device, dtype=torch.long),
-        query_lens,
-        output_size=num_tokens,
-    )
-    token_offsets = torch.arange(num_tokens, device=query_start_loc.device) - query_start_loc[req_ids]
+    if query_lens.numel() == 0:
+        return torch.zeros((num_tokens, 1), dtype=torch.int32, device=query_start_loc.device)
+    tokens = torch.arange(num_tokens, dtype=query_start_loc.dtype, device=query_start_loc.device)
+    # right=True skips zero-length requests, including graph padding.
+    req_ids = torch.searchsorted(query_start_loc[1:].contiguous(), tokens, right=True)
+    req_ids = req_ids.clamp_max(query_lens.shape[0] - 1)
+    token_offsets = tokens - query_start_loc[req_ids]
     positions = seq_lens[req_ids] - query_lens[req_ids] + token_offsets
     lower = replay_start[: query_lens.shape[0]].to(positions.dtype)[req_ids]
-    start_positions = torch.maximum(positions - int(window_size) + 1, lower).clamp_min(0)
-    return (positions - start_positions + 1).to(torch.int32).unsqueeze(1)
+    start_positions = torch.maximum(
+        positions - int(window_size) + 1,
+        lower,
+    ).clamp_min(0)
+    visible = (positions - start_positions + 1).clamp_min(0)
+    visible = torch.where(tokens < query_start_loc[-1], visible, 0)
+    return visible.to(torch.int32).unsqueeze(1)
 
 
 @dataclass
@@ -887,6 +876,9 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
         self._slot_mapping = torch.full((max_tokens,), -1, dtype=torch.int64, device=device)
         self._slot_mapping_2d = torch.full((max_tokens, 2), -1, dtype=torch.int32, device=device)
         self._flat_slot_mapping = torch.full((max_tokens,), -1, dtype=torch.int64, device=device)
+        self._replay_visible_lens = (
+            torch.zeros((max_tokens, 1), dtype=torch.int32, device=device) if self._cache_kind == "swa" else None
+        )
         self._seq_lens = torch.zeros(max_reqs, dtype=torch.int32, device=device)
         self._max_tokens = max_tokens
         self._dspark_swa_indices = None
@@ -941,6 +933,30 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
         kv_cache_spec,
     ) -> AttentionCGSupport:
         return AttentionCGSupport.UNIFORM_BATCH
+
+    @classmethod
+    def get_varlen_cudagraph_max_query_len(
+        cls,
+        vllm_config: VllmConfig,
+        kv_cache_spec,
+    ) -> int | None:
+        spec = vllm_config.speculative_config
+        if spec is None or spec.method != "dspark" or not spec.enable_adaptive_verification:
+            return None
+        num_drafts = spec.num_speculative_tokens
+        if num_drafts is None:
+            return None
+        parallel = vllm_config.parallel_config
+
+        # CP partitions requests from host boundaries, which are placeholders
+        # after device-side draft ranking. Do not advertise that combination.
+        if parallel.prefill_context_parallel_size > 1 or parallel.decode_context_parallel_size > 1:
+            return None
+
+        # Every proposed row is written to the C2 ring before rejection. Keep
+        # the first accepted row available when the next step rolls back to it.
+        # Wider blocks could overwrite that row even if only the anchor survives.
+        return min(1 + num_drafts, STATE_RING_ROWS)
 
     def build_for_cudagraph_capture(
         self,
@@ -1169,15 +1185,15 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
                 else:
                     if compressed and req.compress_ratio != 1:
                         active_slots = compressed_slot_mapping(active_slots, req.compress_ratio)
-                    valid = active_slots >= 0
+                    valid_end = common.query_start_loc[req.num_actual_reqs].clamp_max(req.num_actual_tokens)
+                    valid = (active_slots >= 0) & (
+                        torch.arange(req.num_input_tokens, device=active_slots.device) < valid_end
+                    )
                     if compressed and req.compress_ratio == 2:
                         if kwargs.get("skip_ring_state_update", False):
                             valid.zero_()
-                        else:
-                            valid_end = common.query_start_loc[req.num_actual_reqs].clamp_max(req.num_actual_tokens)
-                            valid &= torch.arange(req.num_input_tokens, device=active_slots.device) < valid_end
-                            if req.positions is not None:
-                                valid &= req.positions.remainder(2) == 1
+                        elif req.positions is not None:
+                            valid &= req.positions.remainder(2) == 1
                     physical = active_slots.clamp_min(0)
                     self._slot_mapping_2d[: req.num_input_tokens, 0].copy_(
                         torch.where(
@@ -1236,6 +1252,8 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
         req.ori_sparse_indices = kwargs.get("ori_sparse_indices")
         req.ori_topk_length = None
         replay_start = kwargs.get("replay_start")
+        if replay_start is None:
+            replay_start = getattr(common, "replay_start", None)
         req.replay_seq_lens = req.replay_block_table = req.replay_cache_blocks = req.replay_cache_offsets = None
         max_ori_seq_len = int(getattr(common, "max_seq_len", 0))
         if replay_start is not None:
@@ -1283,6 +1301,27 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
             indices_view.copy_(req.ori_sparse_indices)
             lengths_view.copy_(req.ori_topk_length)
             req.ori_sparse_indices, req.ori_topk_length = indices_view, lengths_view
+
+        if req.ori_topk_length is None and req.ori_sparse_indices is not None and noncausal:
+            req.ori_topk_length = (req.ori_sparse_indices >= 0).sum(dim=-1, dtype=torch.int32)
+
+        replay_visible_lens = None
+        if replay_start is not None and req.cache_kind == "swa":
+            replay_visible_lens = self.common_v41_batch_metadata.get("swa:replay-visible")
+            if replay_visible_lens is None:
+                assert self._replay_visible_lens is not None
+                replay_visible_lens = self._replay_visible_lens[: req.num_input_tokens]
+                replay_visible_lens.copy_(
+                    build_replay_swa_visible_lens(
+                        window_size,
+                        common.query_start_loc[: req.num_reqs + 1],
+                        req.seq_lens,
+                        replay_start,
+                        req.num_input_tokens,
+                    )
+                )
+                self.common_v41_batch_metadata["swa:replay-visible"] = replay_visible_lens
+
         if (
             not noncausal
             and req.ori_sparse_indices is None
@@ -1296,43 +1335,29 @@ class AscendDSAV41MetadataBuilder(AttentionMetadataBuilder[AscendDSAV41Metadata]
                 cached_window = self._device_backend.build_window_indices(
                     req.positions[: req.num_input_tokens],
                     window_size,
+                    visible_lens=replay_visible_lens,
                     indices_output=self._a5_causal_swa_indices[: req.num_input_tokens],
                     lengths_output=self._a5_causal_swa_lengths[: req.num_input_tokens],
                 )
                 self.common_v41_batch_metadata[cache_key] = cached_window
             req.ori_sparse_indices, req.ori_topk_length = cached_window
-        if req.ori_topk_length is None and req.ori_sparse_indices is not None and noncausal:
-            req.ori_topk_length = (req.ori_sparse_indices >= 0).sum(dim=-1, dtype=torch.int32)
 
-        # SWA bounded replay (vLLM #56227): a prefill admission that hit the
-        # prefix cache recomputes the hit's last window, and only the
-        # sliding-window group is rebuilt by it. That group's window is the one
-        # that can reach below ``replay_start`` into the region it does not hold,
-        # so the floor rides ``ori_topk_length``, the operator's per-token
-        # channel for "how many ori KV entries this query may see". The window's
-        # width stays a scalar (``ori_win_left``) and still bounds it from above,
-        # so this only ever narrows the mask, and only for the requests that are
-        # replaying.
-        #
-        # Only the sliding-window group carries it, because
-        # ``_forward_attention`` reads the mask and this length from
-        # ``metadata.swa`` whichever group's loop ranges it was handed, and those
-        # ranges come from the same band -- so they stay a superset of the window.
-        replay_start = getattr(common, "replay_start", None)
-        replay_visible_lens = None
-        if replay_start is not None and req.cache_kind == "swa":
-            replay_visible_lens = build_replay_swa_visible_lens(
-                window_size,
-                common.query_start_loc[: req.num_reqs + 1],
-                req.seq_lens,
-                replay_start,
-                req.num_actual_tokens,
-            )
-        # In band mode this tensor is the per-token visible length; the sparse
-        # path above is its other producer, and that one pairs it with an index
-        # list. The operator's mask mode is therefore the band in both cases.
         if replay_visible_lens is not None:
             req.ori_topk_length = replay_visible_lens
+
+        metadata_tokens = req.num_input_tokens if self._device_metadata_in_graph else req.num_actual_tokens
+        if self._a5_smla_length_rows is not None and req.ori_topk_length is not None and metadata_tokens > 0:
+            # The deferred A5 SMLA metadata task reads this persistent buffer
+            # as its (ori, cmp) length rows. Feed it the same per-token
+            # lengths the attention op consumes, so the task table it bakes
+            # into the graph stays consistent with the runtime window: the
+            # buffer was allocated with torch.empty and never written, so the
+            # captured task table previously came from uninitialized memory.
+            src_rows = req.ori_topk_length[:metadata_tokens]
+            if src_rows.dim() == 1:
+                src_rows = src_rows.unsqueeze(1)
+            self._a5_smla_length_rows[:metadata_tokens].copy_(src_rows.to(torch.int32).reshape(-1, 1))
+
         req.ori_mask_mode = 0 if noncausal else 4
         req.ori_win_left = max(0, window_size - 1)
         req.ori_win_right = 0
@@ -1737,6 +1762,12 @@ def _get_v41_role_builder(role: str):
 
 class DeepseekV41CacheBackend(AttentionBackend):
     """Cache-only backend: supplies layout and metadata, not an AttentionImpl."""
+
+    @classmethod
+    def supports_device_cpu_query_lens_mismatch(cls) -> bool:
+        # Cache writes, compressed lengths, C2 state and attention/indexer tiling
+        # consume device boundaries. Host lengths are scheduling upper bounds.
+        return True
 
     @staticmethod
     def get_name():
