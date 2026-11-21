@@ -39,6 +39,7 @@ def _write_keypool_caches_kernel(
     FP8: tl.constexpr,
     INT8: tl.constexpr,
     BLOCK: tl.constexpr,
+    projected_rows=None,
 ):
     row = tl.program_id(0)
     cols = tl.arange(0, BLOCK)
@@ -47,9 +48,12 @@ def _write_keypool_caches_kernel(
         dest = tl.load(writes + input_row).to(tl.int64)
         valid = (dest >= 0) & (dest // PAGE_ROWS < tail_blocks) & (dest % PAGE_ROWS < CAPACITY)
         if SPECULATIVE:
-            k = tl.load(key + row * HEAD_DIM + cols, valid & (cols < HEAD_DIM), other=0)
+            src = row
+            if projected_rows is not None:
+                src = tl.load(projected_rows + row, valid, other=0).to(tl.int64)
+            k = tl.load(key + src * HEAD_DIM + cols, valid & (cols < HEAD_DIM), other=0)
             g = tl.load(
-                gate + row * HEAD_DIM + cols - HEAD_DIM, valid & (cols >= HEAD_DIM) & (cols < 2 * HEAD_DIM), other=0
+                gate + src * HEAD_DIM + cols - HEAD_DIM, valid & (cols >= HEAD_DIM) & (cols < 2 * HEAD_DIM), other=0
             )
             tail_value = tl.where(cols < HEAD_DIM, k, g)
         else:
@@ -76,7 +80,18 @@ def _write_keypool_caches_kernel(
 
 
 def write_keypool_caches(
-    tail, cache, key, gate, pooled, metadata, tail_metadata, state, scale_cache=None, pooled_scales=None
+    tail,
+    cache,
+    key,
+    gate,
+    pooled,
+    metadata,
+    tail_metadata,
+    state,
+    scale_cache=None,
+    pooled_scales=None,
+    *,
+    projected_row_indices=None,
 ):
     inputs = tail_metadata.cann_inputs
     writes = inputs.write_indices
@@ -119,6 +134,7 @@ def write_keypool_caches(
         fp8,
         int8,
         triton.next_power_of_2(2 * cache.shape[-1]),
+        projected_rows=projected_row_indices,
     )
 
 
@@ -271,7 +287,11 @@ def _build_keypool_metadata_kernel(
         tl.store(writes + row[:, None] * WIDTH + cols[None, :], address, (row[:, None] < n) & (cols[None, :] < WIDTH))
     else:
         pos = tl.load(raw_positions + row * POS_STRIDE, row < source, other=0).to(tl.int64)
-        slot = tl.load(raw_slots + row * SLOT_STRIDE, row < source, other=-1).to(tl.int64)
+        # Use the same padding convention as the request boundaries above.
+        # The graph may own more rows than the live device partition.
+        live_end = tl.load(raw_query + n * QUERY_STRIDE)
+        live_end = tl.minimum(tl.where(live_end < 0, actual, live_end), actual)
+        slot = tl.load(raw_slots + row * SLOT_STRIDE, (row < source) & (row < live_end), other=-1).to(tl.int64)
         compressed = slot // LOGICAL * (LOGICAL // POOL) + slot % LOGICAL // POOL
         tl.store(positions + row, pos, row < tokens)
         tl.store(slots + row, tl.where((slot >= 0) & ((pos + 1) % POOL == 0), compressed, -1), row < tokens)

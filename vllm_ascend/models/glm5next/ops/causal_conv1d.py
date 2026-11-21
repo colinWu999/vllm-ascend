@@ -7,6 +7,7 @@ from fla_npu.ops.ascendc import causal_conv1d_fn, causal_conv1d_update
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
 from vllm_ascend.ops.triton.kda.conv_state import copy_conv_state
+from vllm_ascend.ops.triton.kda.short_conv import verify_short_conv
 
 
 def causal_conv1d(
@@ -20,6 +21,7 @@ def causal_conv1d(
     initial_state_mode: torch.Tensor | None = None,
     num_accepted_tokens: torch.Tensor | None = None,
     output_buffer: torch.Tensor | None = None,
+    max_query_len: int | None = None,
 ) -> torch.Tensor:
     """Consume GDN metadata and update the caller's [cache, state_len, dim] state."""
     output = None
@@ -29,6 +31,13 @@ def causal_conv1d(
             raise ValueError("Convolution output buffer must cover the input rows and match its feature shape")
     if cache_indices.shape[0] == 0:
         return torch.zeros_like(x) if output is None else output
+    if run_mode == 1 and max_query_len is not None:
+        if num_accepted_tokens is None:
+            raise ValueError("Adaptive convolution requires previous accepted-token counts")
+        indices = cache_indices[:, 0] if cache_indices.ndim == 2 else cache_indices
+        return verify_short_conv(
+            x, weight, conv_state, query_start_loc, indices, num_accepted_tokens, max_query_len, output
+        )
     kernel_state = conv_state
     # GLM metadata shares a contiguous vector across this group's layers.
     # Standalone callers can still pass a matrix, using its first column.

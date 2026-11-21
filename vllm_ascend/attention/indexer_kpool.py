@@ -4,7 +4,7 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from functools import partial
+from functools import cached_property, partial
 from importlib import import_module
 from typing import Any
 
@@ -40,6 +40,7 @@ from vllm_ascend.core.kv_cache_interface import (
 )
 from vllm_ascend.device.hardware_profile import AttentionBackendFamily, get_current_hardware_profile
 from vllm_ascend.distributed.utils import all_gather_async
+from vllm_ascend.models.glm5next.adaptive import glm_mtp_adaptive_query_len
 
 GLM5_NEXT_SFA_KERNEL_BLOCK_SIZE = 128
 
@@ -251,7 +252,17 @@ class _KPoolMetadataBuffers:
     pooled_slot_mapping: torch.Tensor
 
 
-class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
+class _KPoolMetadataBuilder(AttentionMetadataBuilder):
+    @cached_property
+    def _adaptive_query_width(self) -> int | None:
+        return glm_mtp_adaptive_query_len(self.vllm_config)
+
+    @classmethod
+    def get_varlen_cudagraph_max_query_len(cls, vllm_config: VllmConfig, kv_cache_spec) -> int | None:
+        return glm_mtp_adaptive_query_len(vllm_config)
+
+
+class AscendIndexerKPoolMetadataBuilder(_KPoolMetadataBuilder):
     """Build pool-level addressing for the compressed indexer cache."""
 
     @classmethod
@@ -338,10 +349,20 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
         a slice boundary reports the last covered row's visible length, and
         CANN's causal masking derives the remaining rows from it.
         """
+        # Adaptive draft allocation can change individual request boundaries
+        # and visible lengths on device, invalidating host-planned row slices.
+        if getattr(common_attn_metadata, "has_adaptive_draft_tokens", False):
+            return None
         num_rows = int(common_attn_metadata.num_actual_tokens)
         if not self._indexer_row_sharding_supported(num_rows, graph_capture):
             return None
         num_reqs = common_attn_metadata.num_reqs
+        if self._adaptive_query_width is not None:
+            # Draft metadata can be built separately from the target's budget
+            # marker. Host row slicing requires a known, pure prefill partition.
+            phase = getattr(common_attn_metadata, "is_prefilling", None)
+            if phase is None or phase.device.type != "cpu" or phase.numel() < num_reqs or not phase[:num_reqs].all():
+                return None
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1].to(
             dtype=torch.int64, device="cpu"
         )
@@ -425,6 +446,12 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
     def _get_state_table(self, common: CommonAttentionMetadata, graph_capture: bool, step: int) -> torch.Tensor:
         # Capture owns each table; eager shapes reuse one growing allocation.
         width = getattr(common, "max_query_len", common.num_input_tokens)
+        # Capture and replay must select the same state-table width even when
+        # the CPU partition understates the device's longest verification.
+        adaptive_width = self._adaptive_query_width
+        if adaptive_width is not None:
+            # Prefill may exceed the verification bound; retain its full width.
+            width = max(width, adaptive_width)
         cols = 1 + (width + self.compress_ratio - 1) // self.compress_ratio
         shape = (common.num_reqs, cols)
         key = (step, *shape)
@@ -619,7 +646,7 @@ class AscendIndexerKPoolTailMetadata:
     write_slot_mapping: torch.Tensor | None = None
 
 
-class AscendIndexerKPoolTailMetadataBuilder(AttentionMetadataBuilder):
+class AscendIndexerKPoolTailMetadataBuilder(_KPoolMetadataBuilder):
     """Build independent metadata for the GLM-Next compressor tail."""
 
     @classmethod
@@ -687,9 +714,11 @@ class AscendIndexerKPoolTailMetadataBuilder(AttentionMetadataBuilder):
                     for name in ("writes", "state", "retained")
                 },
             }
-        retained_width = (
-            min(self.block_size, getattr(write_common, "max_query_len", self.block_size)) if self._lookahead else 0
-        )
+        max_query_len = getattr(write_common, "max_query_len", self.block_size)
+        adaptive_width = self._adaptive_query_width
+        if adaptive_width is not None:
+            max_query_len = max(max_query_len, adaptive_width)
+        retained_width = min(self.block_size, max_query_len) if self._lookahead else 0
         cann_inputs = build_tail_inputs(
             write_common,
             self._pool_size,
@@ -780,6 +809,7 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
     """
 
     _head_weight_f32: torch.Tensor | None
+    _adaptive_verification: bool = False
 
     def __init__(self, vllm_indexer: nn.Module, qk_rope_head_dim: int) -> None:
         super().__init__()
@@ -788,6 +818,7 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
                 f"GLM-Next KPool indexing supports NoPE queries only, got qk_rope_head_dim={qk_rope_head_dim}."
             )
         parallel_config = vllm_indexer.vllm_config.parallel_config
+        self._adaptive_verification = glm_mtp_adaptive_query_len(vllm_indexer.vllm_config) is not None
         if parallel_config.decode_context_parallel_size > 1:
             raise NotImplementedError("GLM-Next KPool indexing does not support DCP.")
 
@@ -1090,9 +1121,17 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
         else:
             pooled_scales = None
         tail_key = tail_gate = None
-        if tail_metadata.cann_inputs.retained_indices is not None:
-            # Re-project the live MTP rollback window missing from CANN state.
-            tail_hidden = self._gather_retained_hidden(hidden_states, tail_metadata.cann_inputs.retained_indices)
+        retained = tail_metadata.cann_inputs.retained_indices
+        projected_row_indices = None
+        if retained is not None:
+            # Each request reserves a full rollback window. A compact verify
+            # batch can contain far fewer tokens than these rectangular slots.
+            # Linear projection and layer norm both operate independently per row.
+            if self._adaptive_verification and hidden_states.shape[0] <= retained.numel():
+                tail_hidden = hidden_states
+                projected_row_indices = retained.flatten()
+            else:
+                tail_hidden = self._gather_retained_hidden(hidden_states, retained)
             tail_key = F.linear(tail_hidden, key_weight).float()
             if norm_weight is not None:
                 tail_key = F.layer_norm(tail_key, (self.head_dim,), norm_weight, norm_bias, norm_eps)
@@ -1108,6 +1147,7 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
             state,
             scale_cache=indexer_scale_cache,
             pooled_scales=pooled_scales,
+            projected_row_indices=projected_row_indices,
         )
         # Sharing top-k still advances the compressed cache and raw tail.
         if not compute_topk:

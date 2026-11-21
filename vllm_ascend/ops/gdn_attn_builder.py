@@ -179,6 +179,9 @@ class GDNSpecDecodeMetadata:
     use_upstream_recurrent: bool = False
     # Adaptive FULL graphs retain padded token tensors as query lengths vary.
     use_upstream_conv: bool = False
+    # In mixed GLM verification, all verification requests may precede prefill.
+    # The group boundary stays fixed when drafts move between those requests.
+    spec_tokens_are_prefix: bool = False
 
 
 def _build_actual_seq_lengths(
@@ -1082,6 +1085,15 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             attn_metadata, non_spec_chunked_prefill_metadata, non_spec_conv1d_cache_indices
         )
         self._attach_spec_decode_metadata(attn_metadata)
+        if (
+            getattr(m, "has_adaptive_draft_tokens", False)
+            and num_prefills > 0
+            and num_spec_decodes > 0
+            and spec_sequence_masks_cpu is not None
+        ):
+            attn_metadata.spec_decode_metadata.spec_tokens_are_prefix = bool(
+                spec_sequence_masks_cpu[:num_spec_decodes].all()
+            )
         self._attach_non_spec_decode_metadata(attn_metadata, non_spec_conv1d_cache_indices)
         return self._finalize_metadata(attn_metadata)
 

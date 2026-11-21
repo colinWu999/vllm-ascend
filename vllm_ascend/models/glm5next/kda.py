@@ -35,6 +35,7 @@ from vllm_ascend.attention.utils import (
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import record_attention_compute_start
 from vllm_ascend.distributed.parallel_state import get_qkv_iproj_tp_group
+from vllm_ascend.models.glm5next.adaptive import glm_mtp_adaptive_query_len, validate_glm_mtp_adaptive
 from vllm_ascend.models.glm5next.kda_input_projection_tp import KDAInputProjectionTP
 from vllm_ascend.models.glm5next.ops.causal_conv1d import causal_conv1d
 from vllm_ascend.models.glm5next.ops.kda import KDA_MAX_RECURRENT_TOKENS, chunk_kda, recurrent_kda
@@ -308,6 +309,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         prefix: str = "",
     ) -> None:
         # KDA projections remain BF16 because fp8 checkpoints omit their scales.
+        validate_glm_mtp_adaptive(vllm_config)
+        self.use_adaptive_verification = glm_mtp_adaptive_query_len(vllm_config) is not None
         self.use_recoverssm = use_glm_recoverssm(vllm_config)
         saved_quant_config = vllm_config.quant_config
         try:
@@ -644,6 +647,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         num_accepted_tokens = attn_metadata_narrowed.num_accepted_tokens
         num_spec_decodes = attn_metadata_narrowed.num_spec_decodes
         use_spec = num_spec_decodes > 0 and spec_state_indices_tensor is not None
+        adaptive = getattr(self, "use_adaptive_verification", False)
         # Safe-gate checkpoints use the bounded sigmoid variant.
         lower_bound = self.kda_lower_bound
 
@@ -669,6 +673,8 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         # num_accepted_tokens for rejection-sampling rollback; non-spec tokens
         # are one-per-request. Mirrors olmo_gdn_linear_attn.py. Projections are
         # [n, *] (token dim 0); g1/beta are [1, n, h, d] (token dim 1).
+        non_spec_slice = None
+        verify_out = None
         if use_spec:
             # In a pure spec-verify step (no non-spec tokens) the metadata
             # builder sets spec_token_indx = arange(num_actual_tokens), making
@@ -680,16 +686,25 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 qkv_spec = qkv_proj_states
                 g1_spec = g1
                 beta_spec = beta
+                qkv_ns = g1_ns = beta_ns = None
+                if adaptive:
+                    verify_out = core_attn_out
+            elif adaptive and getattr(attn_metadata_narrowed.spec_decode_metadata, "spec_tokens_are_prefix", False):
+                # Requests are packed contiguously, in verification then prefill
+                # order. Use the group sizes only; individual lengths are on device.
+                prefix = spec_token_indx.numel()
+                non_spec_slice = slice(prefix, prefix + non_spec_token_indx.numel())
+                qkv_spec, qkv_ns = qkv_proj_states[:prefix], qkv_proj_states[non_spec_slice]
+                g1_spec, g1_ns = g1[:, :prefix], g1[:, non_spec_slice]
+                beta_spec, beta_ns = beta[:, :prefix], beta[:, non_spec_slice]
+                verify_out = core_attn_out[:, :prefix]
             else:
                 qkv_spec = qkv_proj_states.index_select(0, spec_token_indx)
                 g1_spec = g1.index_select(1, spec_token_indx)
                 beta_spec = beta.index_select(1, spec_token_indx)
-            if non_spec_token_indx is not None and non_spec_token_indx.numel() > 0:
                 qkv_ns = qkv_proj_states.index_select(0, non_spec_token_indx)
                 g1_ns = g1.index_select(1, non_spec_token_indx)
                 beta_ns = beta.index_select(1, non_spec_token_indx)
-            else:
-                qkv_ns = g1_ns = beta_ns = None
         else:
             qkv_spec = g1_spec = beta_spec = None
             qkv_ns, g1_ns, beta_ns = qkv_proj_states, g1, beta
@@ -708,6 +723,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                 run_mode=1,
                 num_accepted_tokens=conv_meta.num_accepted_tokens,
                 output_buffer=conv_meta.output_buffer,
+                max_query_len=self.num_spec + 1 if adaptive else None,
             )
             q_spec, k_spec, v_spec = qkv_spec.split(self.local_projection_size, dim=-1)
 
@@ -785,11 +801,14 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
                     self.dt_bias,
                     lower_bound,
                     num_accepted_tokens,
+                    use_triton=adaptive,
+                    output_buffer=verify_out,
                 )
-            if spec_token_indx is None:
-                core_attn_out[:, : spec_output.shape[1]].copy_(spec_output)
-            else:
-                core_attn_out[0].index_copy_(0, spec_token_indx, spec_output[0])
+            if verify_out is None:
+                if spec_token_indx is None:
+                    core_attn_out[:, : spec_output.shape[1]].copy_(spec_output)
+                else:
+                    core_attn_out[0].index_copy_(0, spec_token_indx, spec_output[0])
 
         if q_ns is None:
             maybe_save_kv_layer_to_connector("", [])
@@ -833,7 +852,9 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         if direct_output:
             maybe_save_kv_layer_to_connector("", [])
             return
-        if use_spec:
+        if non_spec_slice is not None:
+            core_attn_out[0, non_spec_slice].copy_(output[0])
+        elif use_spec:
             core_attn_out[0].index_copy_(0, non_spec_token_indx, output[0])
         else:
             core_attn_out[0, : output.shape[1]].copy_(output[0])
